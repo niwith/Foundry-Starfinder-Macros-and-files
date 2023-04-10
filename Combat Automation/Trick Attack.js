@@ -1,108 +1,66 @@
-const trickSkillId = "sle"; // modify this to be yours
-
-
 const clickEvent = event;
+game.macros.getName("CombatAutomationHelpers").execute();
 
-const target = getSingleTarget();
+const target = combatAutomationHelpers.getSingleTarget();
 if (!target) return;
 
+const canTrickAttack = combatAutomationHelpers.checkTokenHasAnyFeatureByNames(token, ["Trick Attack (Ex)", "Sniper"]);
+if (!canTrickAttack) return;
 
-const targetDC = target.actor.system.details.cr + 20;
+const trickAttackFeature = token.actor.items.find(item => item.name === "Trick Attack (Ex)");
+const sniperFeature = token.actor.items.find(item => item.name === "Sniper");
 
-const trickSkill = token.actor.system.skills[trickSkillId];
-const completedRoll = await actor.rollSkill(trickSkillId);
-const rollResult = completedRoll.callbackResult._total;
+const trickAttackWeaponFilter = (weapon) => 
+  (!weapon.system.properties.unwieldy || (weapon.system.weaponType == "sniper" && sniperFeature)) // can't be an unwieldy weapon, unless its a sniper 
+  && (
+    (weapon.system.weaponType == "basicM" && weapon.system.properties.operative) // operative melee weapons
+    || weapon.system.weaponType == "smallA" // all small arms are valid
+    || (weapon.system.weaponType == "sniper" && sniperFeature) // snipers can be valid if certain class features picked
+  );
+
+const selectedWeapon = await combatAutomationHelpers.selectWeaponAsync(token, trickAttackWeaponFilter);
+if (!selectedWeapon) return;
+
+const weaponCanAttack = combatAutomationHelpers.checkWeaponCanAttack(selectedWeapon);
+if (!weaponCanAttack) return;
+
+const validTrickAttackSkills = ["ste", "blu", "int"];
+const operativeSpecialization = token.actor.items.find(item => item.system.source === "Specialization");
+if (operativeSpecialization) {
+  operativeSpecialization.system.modifiers
+    .filter(modifier => modifier.effectType === "skill-ranks" && modifier.modifierType === "constant") // Shouldn't actually be any other effects but just to be safe
+    .forEach(modifier => validTrickAttackSkills.push(modifier.valueAffected))
+}
+const trickSkillId = await combatAutomationHelpers.getSkillToUseAsync(token, validTrickAttackSkills);
+
+const completedRoll = await token.actor.rollSkill(trickSkillId);
+await combatAutomationHelpers.waitForDiceRollAsync();
+const rollResult = completedRoll.callbackResult.total;
+
+const targetDetails = target.actor.system.details;
+const targetDC = 20 + (targetDetails.cr ? targetDetails.cr : targetDetails.level.value);
 
 const trickAttackSucceeded = rollResult >= targetDC;
 
-await ChatMessage.create({
-  content: `<h2>Trick Attack</h2><p>Trick attack was ${trickAttackSucceeded ? "successful" : "not successful"}</p>`
-});
+await combatAutomationHelpers.simpleChatMessage("Trick Attack", `Trick attack was ${trickAttackSucceeded ? "successful" : "not successful"}`)
 
-// This is where automation of doing the basic attack would go, but I haven't written that yet
-
-//#region CombatAutomationHelpers.js functions, paste into your combat automation macro
-function getSingleTarget() {
-  const targets = game.user.targets;
-  if (targets.size != 1) {
-      ui.notifications.warn("Macro requires exactly one selected target");
-      return null;
-  }
-  return targets.first();
+if (trickAttackSucceeded) {
+  if (trickAttackFeature) await trickAttackFeature.setActive(true);
+  if (sniperFeature) await sniperFeature.setActive(true);
 }
 
-async function selectWeaponAsync(token, validFilterPredicate = (weapon) => true) {
-  const items = token.actor.items;
-  const equippedWeapons = items.filter(item => item.type === "weapon" && item.config && item.config.hasAttack);
-  const validWeapons = equippedWeapons.filter(validFilterPredicate);
-  console.log(validFilterPredicate);
-  console.log(validWeapons);
-  if (validWeapons.length === 0) {
-      ui.notifications.warn("You have no valid weapons equipped");
-      return null;
-  }
-  if (validWeapons.length === 1) {
-      return validWeapons[0];
-  }
-  
-  const dialogButtons = [];
+const targetAlreadyFlatFooted = target.actor.hasCondition("flat-footed");
 
-  let selectedWeapon = null;
-
-  validWeapons.forEach(weapon => dialogButtons.push({
-      callback: () => selectedWeapon = weapon,
-      icon: '<img src=' + weapon.img + '><br>',
-      label: weapon.name
-  }));
-
-  await Dialog.wait({
-      title: "Select Weapon",
-      buttons: dialogButtons,
-      default: 0
-  });
-
-  return selectedWeapon;
+if (trickAttackSucceeded && !targetAlreadyFlatFooted) {
+  await combatAutomationHelpers.requestApplyConditionStateAsync(target, "flat-footed", true, "trick attack was successful");
 }
 
-async function makeSingleAttackAsync(weapon, target, macroRunEvent) {
-  if (weapon.config.hasCapacity && weapon.getCurrentCapacity() < weapon.system.usage.value) {
-      ui.notifications.warn(game.i18n.format("SFRPG.ItemNoAmmo", { name: weapon.name }));
-      return;
-  }
+await combatAutomationHelpers.makeSingleAttackAsync(selectedWeapon, target, clickEvent);
 
-  const completedAttackRoll = await weapon.rollAttack({ event: macroRunEvent });
-  await wait(1000);
-  const attackRollTotalResult = completedAttackRoll.callbackResult.total;
-  const attackRollDiceResult = completedAttackRoll.callbackResult.dice[0].total;
-
-  const targetAC = target.actor.system.attributes[weapon.system.actionTarget].value;
-
-  const isCrit = attackRollDiceResult == 20;
-  const hitTarget = isCrit || (attackRollTotalResult != 1 && attackRollTotalResult >= targetAC);
-
-  await ChatMessage.create({
-      content: `<h2>Basic Attack</h2><p>Basic attack was a ${hitTarget ? (isCrit ? "crit" : "hit") : "miss"}</p>`
-  });
-
-  if (!hitTarget) {
-      return false;
-  }
-
-  // We always show dialog for crit because user needs to hit the crit button
-  // since i have no idea how to force rollDamage to do a crit
-  let modifiedDamageMacroRunEvent = macroRunEvent;
-  if (isCrit) {
-      modifiedDamageMacroRunEvent = { shiftKey: game.settings.get('sfrpg', 'useQuickRollAsDefault') };
-  }
-
-  await weapon.rollDamage({ event: modifiedDamageMacroRunEvent });
-
-  return true;
+// TODO: Check if operative has class feature letting them keep flat footed applied to enemies
+if (!targetAlreadyFlatFooted && trickAttackSucceeded && target.actor.hasCondition("flat-footed")) {
+  await combatAutomationHelpers.requestApplyConditionStateAsync(target, "flat-footed", false, "trick attack complete");
 }
 
-function wait(time) {
-  return new Promise(resolve => {
-      setTimeout(resolve, time);
-  });
-}
-//#endregion
+if (trickAttackFeature) await trickAttackFeature.setActive(false);
+if (sniperFeature) await sniperFeature.setActive(false);
